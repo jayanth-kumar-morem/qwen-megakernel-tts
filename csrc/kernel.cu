@@ -95,6 +95,36 @@ struct LDGLayerWeights {
 };
 
 // =============================================================================
+// Atomic barrier for persistent kernel (replaces cooperative grid.sync())
+// =============================================================================
+
+struct AtomicGridSync {
+    unsigned int* counter;
+    unsigned int* generation;
+    unsigned int nblocks;
+    unsigned int local_gen;
+
+    __device__ void sync() {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int my_gen = local_gen;
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            unsigned int arrived = atomicAdd(counter, 1);
+            if (arrived == nblocks - 1) {
+                *counter = 0;
+                asm volatile("fence.acq_rel.gpu;" ::: "memory");
+                atomicAdd(generation, 1);
+            } else {
+                volatile unsigned int* vgen = (volatile unsigned int*)generation;
+                while (*vgen <= my_gen) {}
+            }
+            local_gen = my_gen + 1;
+        }
+        __syncthreads();
+    }
+};
+
+// =============================================================================
 // Helpers
 // =============================================================================
 
@@ -237,32 +267,11 @@ __device__ __forceinline__ uint4 ldg_load_weight_u4(const uint4* ptr) {
 }
 
 __device__ __forceinline__ void ldg_load_weight_u8(unsigned int out[8], const __nv_bfloat16* ptr) {
-#if defined(LDG_WEIGHT_L2_EVICT_FIRST)
-    asm volatile("ld.global.L1::no_allocate.L2::evict_first.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-                   "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
-                 : "l"(ptr));
-#elif defined(LDG_WEIGHT_L2_EVICT_LAST)
-    asm volatile("ld.global.L1::no_allocate.L2::evict_last.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-                   "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
-                 : "l"(ptr));
-#elif defined(LDG_WEIGHT_LDCS)
-    asm volatile("ld.global.L1::no_allocate.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-                   "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
-                 : "l"(ptr));
-#elif defined(LDG_WEIGHT_LDCA)
-    asm volatile("ld.global.L1::evict_last.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
-                 : "=r"(out[0]), "=r"(out[1]), "=r"(out[2]), "=r"(out[3]),
-                   "=r"(out[4]), "=r"(out[5]), "=r"(out[6]), "=r"(out[7])
-                 : "l"(ptr));
-#else
+    // v8.b32 (256-bit) not supported on sm_120; use two 128-bit loads.
     uint4 lo = ldg_load_weight_u4(reinterpret_cast<const uint4*>(ptr));
     uint4 hi = ldg_load_weight_u4(reinterpret_cast<const uint4*>(ptr) + 1);
     out[0] = lo.x; out[1] = lo.y; out[2] = lo.z; out[3] = lo.w;
     out[4] = hi.x; out[5] = hi.y; out[6] = hi.z; out[7] = hi.w;
-#endif
 }
 
 // =============================================================================
@@ -270,7 +279,7 @@ __device__ __forceinline__ void ldg_load_weight_u8(unsigned int out[8], const __
 // =============================================================================
 
 __device__ void ldg_matvec_qkv(
-    cg::grid_group& grid,
+    auto& grid,
     const __nv_bfloat16* __restrict__ input,
     const __nv_bfloat16* __restrict__ norm_weight,
     const __nv_bfloat16* __restrict__ q_weight,
@@ -451,7 +460,7 @@ __device__ void ldg_matvec_qkv(
 // =============================================================================
 
 __device__ void ldg_qk_norm_rope_cache(
-    cg::grid_group& grid,
+    auto& grid,
     float* __restrict__ q,
     float* __restrict__ k,
     const float* __restrict__ v,
@@ -588,7 +597,7 @@ __device__ void ldg_prefetch_weights_l2(
 }
 
 __device__ void ldg_attention(
-    cg::grid_group& grid,
+    auto& grid,
     float* __restrict__ q,
     float* __restrict__ k,
     const float* __restrict__ v,
@@ -866,7 +875,7 @@ __device__ void ldg_attention(
 // =============================================================================
 
 __device__ void ldg_o_proj_postnorm_mlp(
-    cg::grid_group& grid,
+    auto& grid,
     const __nv_bfloat16* __restrict__ o_weight,
     const __nv_bfloat16* __restrict__ post_norm_weight,
     const __nv_bfloat16* __restrict__ gate_weight,
@@ -2188,7 +2197,196 @@ __global__ void ldg_lm_head_phase2(
 }
 
 // =============================================================================
-// Launch function
+// Persistent (non-cooperative) decode kernel
+// =============================================================================
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1)
+ldg_decode_kernel_persistent(
+    const __nv_bfloat16* __restrict__ embed_weight,
+    const LDGLayerWeights* __restrict__ layer_weights,
+    const __nv_bfloat16* __restrict__ final_norm_weight,
+    const __nv_bfloat16* __restrict__ cos_table,
+    const __nv_bfloat16* __restrict__ sin_table,
+    __nv_bfloat16* __restrict__ k_cache,
+    __nv_bfloat16* __restrict__ v_cache,
+    __nv_bfloat16* __restrict__ hidden_buffer,
+    float* __restrict__ g_activations,
+    float* __restrict__ g_residual,
+    float* __restrict__ g_q,
+    float* __restrict__ g_k,
+    float* __restrict__ g_v,
+    float* __restrict__ g_attn_out,
+    float* __restrict__ g_mlp_intermediate,
+    float* __restrict__ g_normalized,
+    unsigned int* __restrict__ barrier_counter,
+    unsigned int* __restrict__ barrier_sense,
+    int num_layers,
+    const int* __restrict__ d_position,
+    const int* __restrict__ d_token_id,
+    int max_seq_len,
+    float attn_scale
+) {
+    // Read mutable params from device memory (allows CUDA graph replay)
+    int position = *d_position;
+    int input_token_id = *d_token_id;
+    int cache_len = position + 1;
+    int block_id = blockIdx.x;
+    int num_blocks = gridDim.x;
+
+    // Reset barrier counters on-device (avoids host cudaMemsetAsync overhead)
+    if (block_id == 0 && threadIdx.x == 0) {
+        *barrier_counter = 0;
+        *barrier_sense = 0;
+    }
+    // All blocks must see the reset before proceeding
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        unsigned int arrived = atomicAdd(barrier_counter, 1);
+        if (arrived == (unsigned int)num_blocks - 1) {
+            *barrier_counter = 0;
+            asm volatile("fence.acq_rel.gpu;" ::: "memory");
+            atomicAdd(barrier_sense, 1);
+        } else {
+            volatile unsigned int* vg = (volatile unsigned int*)barrier_sense;
+            while (*vg == 0) {}
+        }
+    }
+    __syncthreads();
+
+    AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x, 1};
+
+    // Embedding lookup
+    const __nv_bfloat16* embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+    for (int i = block_id * LDG_BLOCK_SIZE + threadIdx.x; i < HIDDEN_SIZE; i += num_blocks * LDG_BLOCK_SIZE) {
+        hidden_buffer[i] = __ldg(embed_row + i);
+    }
+    grid.sync();
+
+    int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+
+    for (int layer = 0; layer < num_layers; layer++) {
+        const LDGLayerWeights& w = layer_weights[layer];
+        __nv_bfloat16* layer_k_cache = k_cache + layer * kv_cache_layer_stride;
+        __nv_bfloat16* layer_v_cache = v_cache + layer * kv_cache_layer_stride;
+
+        ldg_matvec_qkv(grid, hidden_buffer, w.input_layernorm_weight,
+            w.q_proj_weight, w.k_proj_weight, w.v_proj_weight,
+            g_activations, g_residual, g_q, g_k, g_v);
+
+        ldg_attention(grid, g_q, g_k, g_v,
+            layer_k_cache, layer_v_cache, g_attn_out,
+            cache_len, max_seq_len, attn_scale,
+            w.q_norm_weight, w.k_norm_weight,
+            cos_table, sin_table, position,
+            w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
+            w.down_proj_weight);
+
+        ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
+            w.gate_proj_weight, w.up_proj_weight, w.down_proj_weight,
+            g_attn_out, g_residual, g_activations, g_mlp_intermediate,
+            hidden_buffer);
+    }
+
+    // Final RMSNorm
+    if (block_id == 0) {
+        __shared__ float smem_reduce[LDG_NUM_WARPS];
+        int warp_id = threadIdx.x / WARP_SIZE;
+        int lane_id = threadIdx.x % WARP_SIZE;
+        float local_sum_sq = 0.0f;
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float v = __bfloat162float(hidden_buffer[i]);
+            g_activations[i] = v;
+            local_sum_sq += v * v;
+        }
+        local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
+        if (lane_id == 0) smem_reduce[warp_id] = local_sum_sq;
+        __syncthreads();
+        if (warp_id == 0) {
+            float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
+            sum = ldg_warp_reduce_sum(sum);
+            if (lane_id == 0) smem_reduce[0] = rsqrtf(sum / float(HIDDEN_SIZE) + LDG_RMS_EPS);
+        }
+        __syncthreads();
+        float rstd = smem_reduce[0];
+        for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+            float wt = __bfloat162float(__ldg(final_norm_weight + i));
+            g_normalized[i] = g_activations[i] * rstd * wt;
+        }
+    }
+}
+
+// =============================================================================
+// Launch functions
+// =============================================================================
+
+static unsigned int* d_barrier_counter = nullptr;
+static unsigned int* d_barrier_sense = nullptr;
+static int* d_mutable_position = nullptr;
+static int* d_mutable_token_id = nullptr;
+int* h_pinned_position = nullptr;  // pinned host memory for CUDA graph compat
+int* h_pinned_token_id = nullptr;
+
+static void ensure_barrier_alloc() {
+    if (!d_barrier_counter) {
+        cudaMalloc(&d_barrier_counter, sizeof(unsigned int));
+        cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
+        cudaMalloc(&d_mutable_position, sizeof(int));
+        cudaMalloc(&d_mutable_token_id, sizeof(int));
+        cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
+        cudaHostAlloc(&h_pinned_token_id, sizeof(int), cudaHostAllocDefault);
+        cudaMemset(d_barrier_counter, 0, sizeof(unsigned int));
+        cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
+    }
+}
+
+static inline void ldg_configure_kernel_attributes();  // forward decl
+
+extern "C" void launch_ldg_decode_persistent(
+    int input_token_id, int* output_token_id,
+    const void* embed_weight, const LDGLayerWeights* layer_weights,
+    const void* final_norm_weight, const void* lm_head_weight,
+    const void* cos_table, const void* sin_table,
+    void* k_cache, void* v_cache,
+    void* hidden_buffer, void* g_activations, void* g_residual,
+    void* g_q, void* g_k, void* g_v, void* g_attn_out,
+    void* g_mlp_intermediate, void* g_normalized,
+    void* block_max_vals, void* block_max_idxs,
+    int num_layers, int position, int cache_len, int max_seq_len,
+    float attn_scale, cudaStream_t stream
+) {
+    ldg_configure_kernel_attributes();
+    ensure_barrier_alloc();
+
+    // Write mutable params via pinned host memory (CUDA graph compatible)
+    *h_pinned_position = position;
+    *h_pinned_token_id = input_token_id;
+    cudaMemcpyAsync(d_mutable_position, h_pinned_position, sizeof(int), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(d_mutable_token_id, h_pinned_token_id, sizeof(int), cudaMemcpyHostToDevice, stream);
+
+    ldg_decode_kernel_persistent<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+        (const __nv_bfloat16*)embed_weight, layer_weights,
+        (const __nv_bfloat16*)final_norm_weight,
+        (const __nv_bfloat16*)cos_table, (const __nv_bfloat16*)sin_table,
+        (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
+        (__nv_bfloat16*)hidden_buffer, (float*)g_activations, (float*)g_residual,
+        (float*)g_q, (float*)g_k, (float*)g_v, (float*)g_attn_out,
+        (float*)g_mlp_intermediate, (float*)g_normalized,
+        d_barrier_counter, d_barrier_sense,
+        num_layers, d_mutable_position, d_mutable_token_id,
+        max_seq_len, attn_scale);
+
+    ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+        (const float*)g_normalized, (const __nv_bfloat16*)lm_head_weight,
+        (float*)block_max_vals, (int*)block_max_idxs);
+
+    ldg_lm_head_phase2<<<1, 256, 0, stream>>>(
+        (const float*)block_max_vals, (const int*)block_max_idxs,
+        output_token_id, LDG_LM_NUM_BLOCKS);
+}
+
+// =============================================================================
+// Launch function (original cooperative)
 // =============================================================================
 
 static inline void ldg_configure_kernel_attributes() {

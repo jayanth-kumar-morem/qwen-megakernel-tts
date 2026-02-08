@@ -81,15 +81,11 @@ if __name__ == "__main__":
     print("=" * 55)
     print()
 
-    print("[1/2] PyTorch (HuggingFace)")
-    hf_tok, hf_ms = bench_pytorch_hf()
-
-    print("[2/2] Megakernel")
+    print("Megakernel")
     mk_tok, mk_ms = bench_megakernel()
 
     print()
     print("=" * 55)
-    print(f"{'Backend':<25} {'tok/s':>8} {'ms/tok':>8} {'Speedup':>8}")
+    print(f"{'Backend':<25} {'tok/s':>8} {'ms/tok':>8}")
     print("-" * 55)
-    print(f"{'PyTorch (HF)':<25} {hf_tok:>8.1f} {hf_ms:>8.2f} {'1.00x':>8}")
-    print(f"{'Megakernel':<25} {mk_tok:>8.1f} {mk_ms:>8.2f} {mk_tok/hf_tok:>7.2f}x")
+    print(f"{'Megakernel':<25} {mk_tok:>8.1f} {mk_ms:>8.2f}")

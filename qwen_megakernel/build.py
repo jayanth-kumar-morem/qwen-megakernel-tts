@@ -21,7 +21,6 @@ KERNEL_FLAGS = [
 ]
 
 CUDA_FLAGS = [
-    "-O3", "--use_fast_math", "-std=c++17", "--expt-relaxed-constexpr",
     "-arch=sm_120a",
     f"-I{_CSRC}",
 ] + KERNEL_FLAGS

@@ -15,7 +15,7 @@ KV_SIZE = 8 * HEAD_DIM      # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
-_decode = torch.ops.qwen_megakernel_C.decode
+_decode = torch.ops.qwen_megakernel_C.decode_persistent
 
 
 def load_weights(model_name="Qwen/Qwen3-0.6B"):
