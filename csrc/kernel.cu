@@ -42,6 +42,9 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 #ifndef LDG_LM_ROWS_PER_WARP
 #define LDG_LM_ROWS_PER_WARP 2
 #endif
+#ifndef LDG_ATTN_BLOCKS
+#define LDG_ATTN_BLOCKS NUM_Q_HEADS
+#endif
 
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
@@ -162,16 +165,26 @@ ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
 
     float local_sum_sq = 0.0f;
 
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float v = __bfloat162float(__ldg(input + i));
-      s_norm[i] = v;
-      local_sum_sq += v * v;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float v0 = __bfloat162float(__ldg(input + i));
+      s_norm[i] = v0;
+      local_sum_sq += v0 * v0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float v1 = __bfloat162float(__ldg(input + i1));
+        s_norm[i1] = v1;
+        local_sum_sq += v1 * v1;
+      }
     }
 
     // Block 0 saves residual for later use
     if (block_id == 0) {
-      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
         g_residual[i] = s_norm[i];
+        int i1 = i + LDG_BLOCK_SIZE;
+        if (i1 < HIDDEN_SIZE) {
+          g_residual[i1] = s_norm[i1];
+        }
       }
     }
 
@@ -192,9 +205,14 @@ ldg_matvec_qkv(auto &grid, const __nv_bfloat16 *__restrict__ input,
 
     float rstd = smem_reduce[0];
 
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float w = __bfloat162float(__ldg(norm_weight + i));
-      s_norm[i] = s_norm[i] * rstd * w;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float w0 = __bfloat162float(__ldg(norm_weight + i));
+      s_norm[i] = s_norm[i] * rstd * w0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float w1 = __bfloat162float(__ldg(norm_weight + i1));
+        s_norm[i1] = s_norm[i1] * rstd * w1;
+      }
     }
     __syncthreads();
   }
@@ -301,7 +319,7 @@ __device__ void ldg_attention(
   int warp_id = threadIdx.x / WARP_SIZE;
   int lane_id = threadIdx.x % WARP_SIZE;
 
-  const int ATTN_BLOCKS = NUM_Q_HEADS; // 16 blocks for 16 Q heads
+  const int ATTN_BLOCKS = LDG_ATTN_BLOCKS;
   const __nv_bfloat16 *cos_pos = cos_table + position * HEAD_DIM;
   const __nv_bfloat16 *sin_pos = sin_table + position * HEAD_DIM;
 
@@ -342,26 +360,32 @@ __device__ void ldg_attention(
     }
   }
   // Attention blocks: Q norm + RoPE for own head (warp 0 only — 128 elements)
-  if (block_id < ATTN_BLOCKS && block_id < NUM_Q_HEADS && warp_id == 0) {
-    float *qh = q + block_id * HEAD_DIM;
-    float ss = 0.0f;
-    for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE)
-      ss += qh[i] * qh[i];
-    ss = ldg_warp_reduce_sum(ss);
-    float sc = rsqrtf(ss / float(HEAD_DIM) + LDG_RMS_EPS);
-    sc = __shfl_sync(0xffffffff, sc, 0);
-    float ql[HEAD_DIM / WARP_SIZE];
+  if (block_id < ATTN_BLOCKS && warp_id == 0) {
+    int heads_per_block = (NUM_Q_HEADS + ATTN_BLOCKS - 1) / ATTN_BLOCKS;
+    int head_start = block_id * heads_per_block;
+    int head_end = min(head_start + heads_per_block, NUM_Q_HEADS);
+    for (int qh_idx = head_start; qh_idx < head_end; qh_idx++) {
+      float *qh = q + qh_idx * HEAD_DIM;
+      float ss = 0.0f;
+      for (int i = lane_id; i < HEAD_DIM; i += WARP_SIZE)
+        ss += qh[i] * qh[i];
+      ss = ldg_warp_reduce_sum(ss);
+      float sc = rsqrtf(ss / float(HEAD_DIM) + LDG_RMS_EPS);
+      sc = __shfl_sync(0xffffffff, sc, 0);
+      float ql[HEAD_DIM / WARP_SIZE];
 #pragma unroll
-    for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
-      ql[j] = qh[i] * sc * __bfloat162float(__ldg(q_norm_weight + i));
+      for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++)
+        ql[j] = qh[i] * sc * __bfloat162float(__ldg(q_norm_weight + i));
 #pragma unroll
-    for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
-      float cv = __bfloat162float(__ldg(cos_pos + i));
-      float sv = __bfloat162float(__ldg(sin_pos + i));
-      int po = (i < HEAD_DIM / 2) ? HEAD_DIM / 2 : -HEAD_DIM / 2;
-      int pi = i + po, pj = pi / WARP_SIZE;
-      float pv = __shfl_sync(0xffffffff, ql[pj], pi % WARP_SIZE);
-      qh[i] = (i < HEAD_DIM / 2) ? ql[j] * cv - pv * sv : pv * sv + ql[j] * cv;
+      for (int i = lane_id, j = 0; i < HEAD_DIM; i += WARP_SIZE, j++) {
+        float cv = __bfloat162float(__ldg(cos_pos + i));
+        float sv = __bfloat162float(__ldg(sin_pos + i));
+        int po = (i < HEAD_DIM / 2) ? HEAD_DIM / 2 : -HEAD_DIM / 2;
+        int pi = i + po, pj = pi / WARP_SIZE;
+        float pv = __shfl_sync(0xffffffff, ql[pj], pi % WARP_SIZE);
+        qh[i] =
+            (i < HEAD_DIM / 2) ? ql[j] * cv - pv * sv : pv * sv + ql[j] * cv;
+      }
     }
   }
 
@@ -663,16 +687,26 @@ __device__ void ldg_o_proj_postnorm_mlp(
     __shared__ float smem_reduce[LDG_NUM_WARPS];
 
     float local_sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float v = g_activations[i];
-      s_act[i] = v;
-      local_sum_sq += v * v;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float v0 = g_activations[i];
+      s_act[i] = v0;
+      local_sum_sq += v0 * v0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float v1 = g_activations[i1];
+        s_act[i1] = v1;
+        local_sum_sq += v1 * v1;
+      }
     }
 
     // Block 0 saves residual for later use
     if (block_id == 0) {
-      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
+      for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
         g_residual[i] = s_act[i];
+        int i1 = i + LDG_BLOCK_SIZE;
+        if (i1 < HIDDEN_SIZE) {
+          g_residual[i1] = s_act[i1];
+        }
       }
     }
 
@@ -693,9 +727,14 @@ __device__ void ldg_o_proj_postnorm_mlp(
 
     float rstd = smem_reduce[0];
 
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float w = __bfloat162float(__ldg(post_norm_weight + i));
-      s_act[i] = s_act[i] * rstd * w;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float w0 = __bfloat162float(__ldg(post_norm_weight + i));
+      s_act[i] = s_act[i] * rstd * w0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float w1 = __bfloat162float(__ldg(post_norm_weight + i1));
+        s_act[i1] = s_act[i1] * rstd * w1;
+      }
     }
     __syncthreads();
   }
@@ -951,6 +990,171 @@ __global__ void ldg_lm_head_phase2(const float *__restrict__ block_max_vals,
   }
 }
 
+__global__ void ldg_lm_head_fused(const float *__restrict__ hidden,
+                                  const __nv_bfloat16 *__restrict__ weight,
+                                  float *__restrict__ block_max_vals,
+                                  int *__restrict__ block_max_idxs,
+                                  int *__restrict__ output_token,
+                                  unsigned int *__restrict__ counter,
+                                  int num_blocks) {
+  __shared__ __align__(16) float s_hidden[HIDDEN_SIZE];
+
+  for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_LM_BLOCK_SIZE) {
+    s_hidden[i] = hidden[i];
+  }
+  __syncthreads();
+
+  int warp_id = threadIdx.x / WARP_SIZE;
+  int lane_id = threadIdx.x % WARP_SIZE;
+
+  int rows_per_block = (LDG_VOCAB_SIZE + gridDim.x - 1) / gridDim.x;
+  int row_start = blockIdx.x * rows_per_block;
+  int row_end = min(row_start + rows_per_block, LDG_VOCAB_SIZE);
+
+  float local_max = -INFINITY;
+  int local_max_idx = -1;
+
+  int warp_stride = LDG_LM_BLOCK_SIZE / WARP_SIZE;
+  int base = row_start + warp_id * LDG_LM_ROWS_PER_WARP;
+
+  for (int m_base = base; m_base < row_end;
+       m_base += warp_stride * LDG_LM_ROWS_PER_WARP) {
+    int rows[LDG_LM_ROWS_PER_WARP];
+    bool valid[LDG_LM_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      rows[r] = m_base + r;
+      valid[r] = rows[r] < row_end;
+    }
+
+    float sum[LDG_LM_ROWS_PER_WARP];
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      sum[r] = 0.0f;
+    }
+
+#pragma unroll 4
+    for (int k = lane_id * 8; k < HIDDEN_SIZE; k += WARP_SIZE * 8) {
+      float4 a1 = *reinterpret_cast<const float4 *>(s_hidden + k);
+      float4 a2 = *reinterpret_cast<const float4 *>(s_hidden + k + 4);
+
+#pragma unroll
+      for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+        if (!valid[r]) {
+          continue;
+        }
+        const __nv_bfloat16 *w_row = weight + rows[r] * HIDDEN_SIZE;
+        uint4 w_u4 =
+            ldg_load_weight_u4(reinterpret_cast<const uint4 *>(w_row + k));
+        __nv_bfloat16 *w_ptr = reinterpret_cast<__nv_bfloat16 *>(&w_u4);
+
+        sum[r] += __bfloat162float(w_ptr[0]) * a1.x +
+                  __bfloat162float(w_ptr[1]) * a1.y +
+                  __bfloat162float(w_ptr[2]) * a1.z +
+                  __bfloat162float(w_ptr[3]) * a1.w +
+                  __bfloat162float(w_ptr[4]) * a2.x +
+                  __bfloat162float(w_ptr[5]) * a2.y +
+                  __bfloat162float(w_ptr[6]) * a2.z +
+                  __bfloat162float(w_ptr[7]) * a2.w;
+      }
+    }
+
+#pragma unroll
+    for (int r = 0; r < LDG_LM_ROWS_PER_WARP; r++) {
+      if (!valid[r]) {
+        continue;
+      }
+      float reduced = ldg_warp_reduce_sum(sum[r]);
+      if (lane_id == 0 && reduced > local_max) {
+        local_max = reduced;
+        local_max_idx = rows[r];
+      }
+    }
+  }
+
+  local_max = __shfl_sync(0xffffffff, local_max, 0);
+  local_max_idx = __shfl_sync(0xffffffff, local_max_idx, 0);
+
+  __shared__ float warp_max[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+  __shared__ int warp_idx[LDG_LM_BLOCK_SIZE / WARP_SIZE];
+
+  if (lane_id == 0) {
+    warp_max[warp_id] = local_max;
+    warp_idx[warp_id] = local_max_idx;
+  }
+  __syncthreads();
+
+  if (warp_id == 0) {
+    float max_val = (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE)
+                        ? warp_max[lane_id]
+                        : -INFINITY;
+    int max_idx =
+        (lane_id < LDG_LM_BLOCK_SIZE / WARP_SIZE) ? warp_idx[lane_id] : -1;
+
+    for (int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+      float other_val = __shfl_down_sync(0xffffffff, max_val, offset);
+      int other_idx = __shfl_down_sync(0xffffffff, max_idx, offset);
+      if (other_val > max_val) {
+        max_val = other_val;
+        max_idx = other_idx;
+      }
+    }
+
+    if (lane_id == 0) {
+      block_max_vals[blockIdx.x] = max_val;
+      block_max_idxs[blockIdx.x] = max_idx;
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    atomicAdd(counter, 1);
+  }
+
+  if (blockIdx.x == 0) {
+    if (threadIdx.x == 0) {
+      volatile unsigned int *vc = (volatile unsigned int *)counter;
+      while (*vc < (unsigned int)num_blocks) {
+      }
+      __threadfence();
+    }
+    __syncthreads();
+
+    __shared__ float s_max_vals[1024];
+    __shared__ int s_max_idxs[1024];
+
+    int tid = threadIdx.x;
+    float local_max2 = -INFINITY;
+    int local_idx2 = -1;
+    for (int i = tid; i < num_blocks; i += blockDim.x) {
+      float val = block_max_vals[i];
+      if (val > local_max2) {
+        local_max2 = val;
+        local_idx2 = block_max_idxs[i];
+      }
+    }
+
+    s_max_vals[tid] = local_max2;
+    s_max_idxs[tid] = local_idx2;
+    __syncthreads();
+
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+      if (tid < s) {
+        if (s_max_vals[tid + s] > s_max_vals[tid]) {
+          s_max_vals[tid] = s_max_vals[tid + s];
+          s_max_idxs[tid] = s_max_idxs[tid + s];
+        }
+      }
+      __syncthreads();
+    }
+
+    if (tid == 0) {
+      *output_token = s_max_idxs[0];
+    }
+  }
+}
+
 // =============================================================================
 // Persistent (non-cooperative) decode kernel
 // =============================================================================
@@ -1043,10 +1247,16 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     int warp_id = threadIdx.x / WARP_SIZE;
     int lane_id = threadIdx.x % WARP_SIZE;
     float local_sum_sq = 0.0f;
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float v = __bfloat162float(hidden_buffer[i]);
-      g_activations[i] = v;
-      local_sum_sq += v * v;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float v0 = __bfloat162float(hidden_buffer[i]);
+      g_activations[i] = v0;
+      local_sum_sq += v0 * v0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float v1 = __bfloat162float(hidden_buffer[i1]);
+        g_activations[i1] = v1;
+        local_sum_sq += v1 * v1;
+      }
     }
     local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
     if (lane_id == 0)
@@ -1060,9 +1270,128 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     }
     __syncthreads();
     float rstd = smem_reduce[0];
-    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE) {
-      float wt = __bfloat162float(__ldg(final_norm_weight + i));
-      g_normalized[i] = g_activations[i] * rstd * wt;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float wt0 = __bfloat162float(__ldg(final_norm_weight + i));
+      g_normalized[i] = g_activations[i] * rstd * wt0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float wt1 = __bfloat162float(__ldg(final_norm_weight + i1));
+        g_normalized[i1] = g_activations[i1] * rstd * wt1;
+      }
+    }
+  }
+}
+
+__global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
+    const __nv_bfloat16 *__restrict__ embed_weight,
+    const LDGLayerWeights *__restrict__ layer_weights,
+    const __nv_bfloat16 *__restrict__ final_norm_weight,
+    const __nv_bfloat16 *__restrict__ cos_table,
+    const __nv_bfloat16 *__restrict__ sin_table,
+    __nv_bfloat16 *__restrict__ k_cache, __nv_bfloat16 *__restrict__ v_cache,
+    __nv_bfloat16 *__restrict__ hidden_buffer,
+    float *__restrict__ g_activations, float *__restrict__ g_residual,
+    float *__restrict__ g_q, float *__restrict__ g_k, float *__restrict__ g_v,
+    float *__restrict__ g_attn_out, float *__restrict__ g_mlp_intermediate,
+    float *__restrict__ g_normalized,
+    unsigned int *__restrict__ barrier_counter,
+    unsigned int *__restrict__ barrier_sense,
+    unsigned int *__restrict__ kv_flag, unsigned int *__restrict__ attn_flag,
+    int num_layers, int position, int input_token_id, int max_seq_len,
+    float attn_scale) {
+  int cache_len = position + 1;
+  int block_id = blockIdx.x;
+  int num_blocks = gridDim.x;
+
+  if (block_id == 0 && threadIdx.x == 0) {
+    *barrier_counter = 0;
+    *barrier_sense = 0;
+    atomicExch(kv_flag, 0u);
+    atomicExch(attn_flag, 0u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    unsigned int arrived = atomicAdd(barrier_counter, 1);
+    if (arrived == (unsigned int)num_blocks - 1) {
+      *barrier_counter = 0;
+      asm volatile("fence.acq_rel.gpu;" ::: "memory");
+      atomicAdd(barrier_sense, 1);
+    } else {
+      volatile unsigned int *vg = (volatile unsigned int *)barrier_sense;
+      while (*vg == 0) {
+      }
+    }
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+  }
+  __syncthreads();
+
+  AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
+                      1};
+
+  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+
+  int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
+
+  for (int layer = 0; layer < num_layers; layer++) {
+    const LDGLayerWeights &w = layer_weights[layer];
+    __nv_bfloat16 *layer_k_cache = k_cache + layer * kv_cache_layer_stride;
+    __nv_bfloat16 *layer_v_cache = v_cache + layer * kv_cache_layer_stride;
+
+    const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
+
+    ldg_matvec_qkv(grid, layer_input, w.input_layernorm_weight, w.q_proj_weight,
+                   w.k_proj_weight, w.v_proj_weight, g_activations, g_residual,
+                   g_q, g_k, g_v);
+
+    ldg_attention(grid, g_q, g_k, g_v, layer_k_cache, layer_v_cache, g_attn_out,
+                  cache_len, max_seq_len, attn_scale, w.q_norm_weight,
+                  w.k_norm_weight, cos_table, sin_table, position,
+                  w.o_proj_weight, w.gate_proj_weight, w.up_proj_weight,
+                  w.down_proj_weight, kv_flag, attn_flag, layer);
+
+    ldg_o_proj_postnorm_mlp(grid, w.o_proj_weight, w.post_attn_layernorm_weight,
+                            w.gate_proj_weight, w.up_proj_weight,
+                            w.down_proj_weight, g_attn_out, g_residual,
+                            g_activations, g_mlp_intermediate, hidden_buffer);
+  }
+
+  if (block_id == 0) {
+    __shared__ float smem_reduce[LDG_NUM_WARPS];
+    int warp_id = threadIdx.x / WARP_SIZE;
+    int lane_id = threadIdx.x % WARP_SIZE;
+    float local_sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float v0 = __bfloat162float(hidden_buffer[i]);
+      g_activations[i] = v0;
+      local_sum_sq += v0 * v0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float v1 = __bfloat162float(hidden_buffer[i1]);
+        g_activations[i1] = v1;
+        local_sum_sq += v1 * v1;
+      }
+    }
+    local_sum_sq = ldg_warp_reduce_sum(local_sum_sq);
+    if (lane_id == 0)
+      smem_reduce[warp_id] = local_sum_sq;
+    __syncthreads();
+    if (warp_id == 0) {
+      float sum = (lane_id < LDG_NUM_WARPS) ? smem_reduce[lane_id] : 0.0f;
+      sum = ldg_warp_reduce_sum(sum);
+      if (lane_id == 0)
+        smem_reduce[0] = rsqrtf(sum / float(HIDDEN_SIZE) + LDG_RMS_EPS);
+    }
+    __syncthreads();
+    float rstd = smem_reduce[0];
+    for (int i = threadIdx.x; i < HIDDEN_SIZE; i += LDG_BLOCK_SIZE * 2) {
+      float wt0 = __bfloat162float(__ldg(final_norm_weight + i));
+      g_normalized[i] = g_activations[i] * rstd * wt0;
+      int i1 = i + LDG_BLOCK_SIZE;
+      if (i1 < HIDDEN_SIZE) {
+        float wt1 = __bfloat162float(__ldg(final_norm_weight + i1));
+        g_normalized[i1] = g_activations[i1] * rstd * wt1;
+      }
     }
   }
 }
@@ -1091,6 +1420,7 @@ static unsigned int *d_barrier_counter = nullptr;
 static unsigned int *d_barrier_sense = nullptr;
 static unsigned int *d_kv_flag = nullptr;
 static unsigned int *d_attn_flag = nullptr;
+static unsigned int *d_lm_head_counter = nullptr;
 static int *d_mutable_position = nullptr;
 static int *d_mutable_token_id = nullptr;
 int *h_pinned_position = nullptr;
@@ -1102,6 +1432,7 @@ static void ensure_barrier_alloc() {
     cudaMalloc(&d_barrier_sense, sizeof(unsigned int));
     cudaMalloc(&d_kv_flag, sizeof(unsigned int));
     cudaMalloc(&d_attn_flag, sizeof(unsigned int));
+    cudaMalloc(&d_lm_head_counter, sizeof(unsigned int));
     cudaMalloc(&d_mutable_position, sizeof(int));
     cudaMalloc(&d_mutable_token_id, sizeof(int));
     cudaHostAlloc(&h_pinned_position, sizeof(int), cudaHostAllocDefault);
@@ -1110,10 +1441,41 @@ static void ensure_barrier_alloc() {
     cudaMemset(d_barrier_sense, 0, sizeof(unsigned int));
     cudaMemset(d_kv_flag, 0, sizeof(unsigned int));
     cudaMemset(d_attn_flag, 0, sizeof(unsigned int));
+    cudaMemset(d_lm_head_counter, 0, sizeof(unsigned int));
   }
 }
 
 static inline void ldg_configure_kernel_attributes(); // forward decl
+
+extern "C" void launch_ldg_decode_direct(
+    int input_token_id, int *output_token_id, const void *embed_weight,
+    const LDGLayerWeights *layer_weights, const void *final_norm_weight,
+    const void *lm_head_weight, const void *cos_table, const void *sin_table,
+    void *k_cache, void *v_cache, void *hidden_buffer, void *g_activations,
+    void *g_residual, void *g_q, void *g_k, void *g_v, void *g_attn_out,
+    void *g_mlp_intermediate, void *g_normalized, void *block_max_vals,
+    void *block_max_idxs, int num_layers, int position, int max_seq_len,
+    float attn_scale, cudaStream_t stream) {
+  ldg_configure_kernel_attributes();
+  ensure_barrier_alloc();
+
+  ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
+      (const __nv_bfloat16 *)embed_weight, layer_weights,
+      (const __nv_bfloat16 *)final_norm_weight,
+      (const __nv_bfloat16 *)cos_table, (const __nv_bfloat16 *)sin_table,
+      (__nv_bfloat16 *)k_cache, (__nv_bfloat16 *)v_cache,
+      (__nv_bfloat16 *)hidden_buffer, (float *)g_activations,
+      (float *)g_residual, (float *)g_q, (float *)g_k, (float *)g_v,
+      (float *)g_attn_out, (float *)g_mlp_intermediate, (float *)g_normalized,
+      d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
+      position, input_token_id, max_seq_len, attn_scale);
+
+  cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
+  ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+      (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
+      (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS);
+}
 
 extern "C" void launch_ldg_decode_persistent(
     int input_token_id, int *output_token_id, const void *embed_weight,
@@ -1146,13 +1508,11 @@ extern "C" void launch_ldg_decode_persistent(
       d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
       d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
-  ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+  cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
+  ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
       (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
-      (float *)block_max_vals, (int *)block_max_idxs);
-
-  ldg_lm_head_phase2<<<1, 256, 0, stream>>>((const float *)block_max_vals,
-                                            (const int *)block_max_idxs,
-                                            output_token_id, LDG_LM_NUM_BLOCKS);
+      (float *)block_max_vals, (int *)block_max_idxs, output_token_id,
+      d_lm_head_counter, LDG_LM_NUM_BLOCKS);
 }
 
 // N-step generate with NO per-step CPU sync. All steps queued back-to-back.
@@ -1204,13 +1564,11 @@ extern "C" void launch_ldg_generate_nosync(
         d_barrier_counter, d_barrier_sense, d_kv_flag, d_attn_flag, num_layers,
         d_mutable_position, d_mutable_token_id, max_seq_len, attn_scale);
 
-    ldg_lm_head_phase1<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
+    cudaMemsetAsync(d_lm_head_counter, 0, sizeof(unsigned int), stream);
+    ldg_lm_head_fused<<<LDG_LM_NUM_BLOCKS, LDG_LM_BLOCK_SIZE, 0, stream>>>(
         (const float *)g_normalized, (const __nv_bfloat16 *)lm_head_weight,
-        (float *)block_max_vals, (int *)block_max_idxs);
-
-    ldg_lm_head_phase2<<<1, 256, 0, stream>>>(
-        (const float *)block_max_vals, (const int *)block_max_idxs,
-        d_output_token, LDG_LM_NUM_BLOCKS);
+        (float *)block_max_vals, (int *)block_max_idxs, d_output_token,
+        d_lm_head_counter, LDG_LM_NUM_BLOCKS);
 
     // Update step: feed output token back, increment position, log result
     ldg_update_step<<<1, 1, 0, stream>>>(d_output_token, d_mutable_token_id,
