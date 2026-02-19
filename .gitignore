@@ -40,5 +40,5 @@ Thumbs.db
 *.safetensors
 .ref/
 
-# Generated audio
-*.wav
+# Generated audio (keep demo_outputs/ tracked)
+# *.wav

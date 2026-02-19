@@ -150,7 +150,22 @@ python3 benchmark.py --text "Your text here" --runs 5
 python3 test_e2e.py
 ```
 
-### Pipecat integration
+### Full voice agent pipeline (STT → LLM → TTS)
+
+```bash
+# WebSocket mode (requires DEEPGRAM_API_KEY and OPENAI_API_KEY)
+export DEEPGRAM_API_KEY=your-key
+export OPENAI_API_KEY=your-key
+python3 demo_voice_agent.py --transport websocket --port 8765
+
+# Text-only mode (no external API keys needed — type text, hear TTS)
+python3 demo_voice_agent.py --text-only
+```
+
+See [`demo_voice_agent.py`](demo_voice_agent.py) for the full Pipecat pipeline wiring:
+`Transport → Deepgram STT → LLM Context → OpenAI LLM → Megakernel TTS → Transport Output`
+
+### Pipecat TTS service
 
 ```python
 from qwen_megakernel.pipecat_tts import MegakernelTTSService
@@ -168,6 +183,13 @@ The service implements the standard Pipecat `TTSService` interface:
 - `TTSStartedFrame` → `TTSAudioRawFrame` chunks → `TTSStoppedFrame`
 - Audio is streamed as 16-bit PCM at 24 kHz
 - First chunk is a single frame (~80ms audio) for minimum TTFC
+
+### Demo recordings
+
+Pre-generated audio samples are in [`demo_outputs/`](demo_outputs/):
+- `demo_short.wav` — "Hello, how are you today?" (4.0s)
+- `demo_medium.wav` — 30-word paragraph (24.0s)
+- `demo_long.wav` — 52-word paragraph (41.6s)
 
 ## Key Design Decisions
 
@@ -209,6 +231,11 @@ qwen_megakernel/
 │   ├── measure_rtf.py         # RTF measurement
 │   ├── measure_tok_s.py       # Decode throughput
 │   └── measure_e2e.py         # End-to-end pipeline
+├── demo_outputs/
+│   ├── demo_short.wav         # "Hello, how are you today?" (4.0s)
+│   ├── demo_medium.wav        # 30-word paragraph (24.0s)
+│   └── demo_long.wav          # 52-word paragraph (41.6s)
+├── demo_voice_agent.py        # Full Pipecat pipeline (STT → LLM → TTS)
 ├── demo_pipeline.py           # Streaming TTS demo
 ├── demo_tts.py                # Non-streaming TTS demo
 ├── benchmark.py               # All-in-one benchmark
