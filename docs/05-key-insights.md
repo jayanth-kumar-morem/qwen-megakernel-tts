@@ -1,143 +1,59 @@
-# Key Insights and Unique Approaches
+# What I Learned Along the Way
 
-## Insight 1: The num_layers Reuse — One Kernel to Rule Them All
+Looking back, a few moments stand out where something clicked and changed how I approached the problem. These aren't things I knew going in — they're things I figured out by reading code, running experiments, and paying attention when something didn't behave the way I expected.
 
-The single most impactful decision in this project was recognizing that the megakernel's `num_layers` parameter is a **runtime** value, not a compile-time constant.
+## Reusing the kernel for the code predictor
 
-When I first looked at the code predictor — a 5-layer transformer that runs 15 times per audio frame to generate codebook groups — my immediate thought was "I'll use PyTorch for this, it's only 5 layers." The first implementation worked: 179ms per frame, using `torch.nn.functional.linear` for each weight matrix, `scaled_dot_product_attention` for attention, etc.
+This was easily the most impactful thing I stumbled onto. The code predictor — the component that takes each audio code and expands it into 15 more codebook groups — is a 5-layer transformer. When I first got it working with standard PyTorch, it took 179ms per audio frame. I did the math and realized that alone blew past the RTF target by a factor of 7. The code predictor was the bottleneck, not the talker decoder.
 
-Then I did the math: 179ms per frame × 12.5 frames/sec = RTF of 2.24. That's 7.5x over the target. The code predictor alone was a dealbreaker.
+I'd been thinking of the megakernel as "the thing that runs the 28-layer talker." But while reading the kernel code, I noticed the layer count isn't hardcoded — it's just a number you pass in. The kernel loops from layer 0 to `num_layers`, doing the same thing each time. I started wondering: what if I pass 5 instead of 28?
 
-I started looking at ways to optimize it: torch.compile, CUDA graphs, custom attention kernels. Then I noticed this line in the megakernel's launch function:
+It took some work to get the code predictor's weights into the exact format the kernel expects, and I had to allocate a separate, smaller KV cache for it. But once I got it running through the megakernel, the time dropped from 179ms to 10.9ms. The whole RTF problem vanished. Zero kernel code changes — just calling the same compiled program with different parameters and different weights.
 
-```c
-for (int layer = 0; layer < num_layers; layer++) {
-    // ... entire transformer layer ...
-}
-```
+## The embedding sentinel trick
 
-The loop count isn't a constant — it comes from the function argument. I could call the same compiled kernel with `num_layers=5` instead of `num_layers=28`. The only requirements were:
-1. Pack the code predictor's weights in the same struct format
-2. Allocate a separate KV cache (sized for 5 layers × 64 max sequence)
-3. Pass dummy embed/lm_head weights (the kernel expects them but I skip the LM head result)
+In normal text generation, the kernel receives a token ID and looks up its embedding from a table. But in TTS, the input at each step is a combination of 16 different embeddings plus a text embedding. There's no single token ID for that.
 
-The result: 179ms → 10.9ms. **18x speedup with zero kernel code changes.** This single insight is what made the RTF target achievable.
+Rather than launching a separate GPU operation to handle this, I added a tiny check to the kernel: if the token ID is negative, skip the table lookup and read from a pre-filled buffer instead. Python writes the combined embedding into this buffer and passes -1 as the token ID. The kernel sees -1, reads the buffer, and proceeds as normal. It's only 3 lines of CUDA code, but it avoids an extra GPU launch on every single frame.
 
-## Insight 2: The Embedding Sentinel — Avoiding a Kernel Launch
+## Warmup is more complicated than I expected
 
-In standard LLM decode, the input is a token ID. The kernel looks up the embedding from a table. But TTS needs a *sum of embeddings* as input — there's no single token to look up.
+I kept running into a pattern where the first call to something was dramatically slower than subsequent calls. The vocoder's first decode took 834ms (subsequent: 38ms). The code predictor's first sampling call took 107ms (subsequent: 13ms). Even simple operations like `torch.multinomial` had a noticeable first-call penalty.
 
-The naive approach would be: compute the embedding sum in PyTorch, copy it to GPU memory, then launch the kernel. But that's an extra CUDA kernel launch (for the copy) and a synchronization point.
+What I eventually understood is that CUDA is deeply lazy. Almost everything — memory allocation, kernel compilation, internal buffer setup — is deferred until it's actually needed. The first time you call an operation, you're paying for all that setup. The second time, it's already done.
 
-Instead, I added a 3-line sentinel check to the kernel: if `token_id < 0`, read from `hidden_buffer` instead of the embedding table. Python writes the summed embedding directly into `hidden_buffer` (a pre-allocated GPU tensor), then calls the kernel with `token_id = -1`. The kernel sees the sentinel, skips the lookup, and reads the buffer. No extra launch, no sync.
+The tricky part was that different code paths have independent warmup needs. Warming up the argmax path (deterministic token selection) doesn't warm up the sampling path (random selection from top candidates), because they use different underlying operations. I had to warm up both explicitly. Same for the vocoder — I ran dummy decode calls with different input sizes to make sure all the internal buffers got pre-allocated.
 
-This is the kind of optimization that doesn't show up as a big number in isolation (~0.1ms saved), but it matters when you're doing it every frame in a tight loop.
+I ended up with a warmup routine that runs 5 predict cycles (2 argmax + 3 sampling) plus 3 vocoder decode calls of different sizes. It adds about 2 seconds to startup, but every subsequent request starts fast.
 
-## Insight 3: Warmup Is Not Optional — And It's Not Just One Path
+## Keeping everything on the GPU
 
-The most frustrating debugging session was tracking down why TTFC was 192ms even after all the obvious optimizations. The profiling breakdown showed:
+There was a subtle performance issue in my code predictor loop. I was writing something like `token = logits.argmax().item()` — the `.item()` call pulls the result from the GPU back to the CPU as a Python integer. Then I'd create a new tensor from that integer to pass back to the GPU. This round-trip forced the CPU to wait for the GPU to finish (a "synchronization point"), and it happened 15 times per frame.
 
-```
-First code predictor call: 107 ms
-Subsequent calls:           13 ms
-```
+The fix was to keep everything as GPU tensors. Instead of `.item()`, I used `.argmax(keepdim=True)` which returns a tensor that stays on the GPU. The embedding lookup can take a tensor directly. No round-trip, no synchronization. It saved about 1.5ms per frame, which adds up across a full utterance.
 
-Something was lazy-initializing on the first sampling call. I had warmup code, but it only ran with `do_sample=False` (argmax). The sampling path uses `torch.multinomial`, `torch.softmax`, and `torch.topk` — each of which allocates CUDA memory and compiles internal kernels on first use.
+## The prefill format is specific and undocumented
 
-The fix was adding warmup iterations with `do_sample=True`:
+I spent a while getting poor audio quality and couldn't figure out why. The kernel was producing correct transformer outputs — I'd validated that. The issue turned out to be the prefill format.
 
-```python
-for do_sample in [False, False, True, True, True]:
-    # ... run a full predict cycle ...
-```
+The talker decoder expects a very specific 8-step conditioning sequence before it starts generating audio. Three of those steps use "thinking tokens" — special IDs (2155, 2156, 2157) that represent a compressed thinking phase. These aren't mentioned in the model card, the config file, or any documentation I could find. I only discovered them by reading through the model's 1,800-line generation script and tracing the exact construction.
 
-Three argmax warmups weren't enough. Two sampling warmups weren't enough. Five total (2 argmax + 3 sampling) finally pre-warmed everything. TTFC dropped to ~92ms.
+My initial implementation used generic padding tokens in those positions. The model still generated audio, but with noticeably worse quality. Once I matched the exact official format, things improved immediately. The lesson: when working with a specific model's expected input format, the source code is the only reliable documentation.
 
-The lesson: in CUDA-land, every operation has a cold start. If your hot path uses sampling, you must warm up the sampling path specifically.
+I had a similar experience with the "trailing text" — the text tokens that feed into the generation loop alongside the audio codes. The official code strips the last 5 tokens from the text before feeding it in, because those tokens are just chat template formatting (`<|im_end|>\n<|im_start|>assistant\n`). Without stripping them, the model tries to "speak" those formatting characters, which produces garbage audio after the actual content finishes.
 
-## Insight 4: The Vocoder Cold Start (834ms → 38ms)
+## Precomputing what doesn't change
 
-The Qwen3-TTS vocoder (speech tokenizer) has an 834ms cold start on its first decode call. This is the autoregressive decoder inside the vocoder allocating attention masks, building causal buffers, and JIT-compiling internal torch operations.
+Every utterance starts with the same role tokens (`<|im_start|>assistant\n`), the same special TTS tokens, and the same codec thinking markers. I was computing these fresh every time, which meant running the text projection network and the embedding lookups on identical inputs over and over.
 
-I added dummy decodes during initialization with progressively larger inputs (1 frame, 1 frame, 5 frames). After that, decode calls take ~38ms consistently.
+Moving these computations to the initialization step — compute once, cache as tensor attributes, reuse forever — saved about 6ms per utterance. That doesn't sound like much, but when your TTFC target is 90ms, 6ms is almost 7% of your budget.
 
-The key was doing this during `initialize()`, not on the first real synthesis call. The user pays 9 seconds of init time once (weight loading + compilation + warmup), then every synthesis starts with everything pre-warmed.
+## Word count is a better estimator than character count
 
-## Insight 5: GPU→CPU Sync Elimination
+Because the M-RoPE limitation means the model doesn't reliably signal when it's done speaking, I needed a heuristic to estimate how many audio frames to generate. My first attempt used character count — something like "3 characters per second." This was wildly off. A 300-character paragraph would get 100 seconds of estimated audio, most of which was silence.
 
-In the code predictor loop, I originally wrote:
+Word count turned out to be much more stable. English speech averages about 150 words per minute, or 2.5 words per second. At 12.5 codec frames per second, each word is about 5 frames. I add a 2x safety margin so the model has room to finish naturally. With this formula, "Hello, how are you today?" (5 words) gets about 50 frames (4 seconds of audio), and a 52-word paragraph gets about 520 frames (42 seconds). The durations match what you'd expect from natural speech.
 
-```python
-token = logits.argmax().item()  # .item() triggers GPU→CPU sync!
-embed = F.embedding(torch.tensor([token], device="cuda"), ...)
-```
+## What I'd explore next
 
-The `.item()` call forces CUDA to synchronize — the CPU waits for the GPU to finish computing the argmax, transfers the integer back, then Python creates a new tensor to pass back to the GPU. This synchronization point costs ~0.1ms per call, which adds up to ~1.5ms per frame (15 groups × 0.1ms).
-
-The fix was to keep everything as tensors:
-
-```python
-token_tensor = logits.argmax(keepdim=True).long()  # stays on GPU
-embed = F.embedding(token_tensor, ...)  # no sync needed
-```
-
-By using tensor slicing (`all_codes[g:g+1]`) instead of `.item()` throughout the pipeline, I eliminated all GPU→CPU synchronization points from the hot path.
-
-## Insight 6: The Official Prefill Format (Reverse-Engineering from Source)
-
-I spent significant time trying to understand why the model's output quality was poor despite the kernel producing correct transformer outputs. The issue turned out to be the prefill format.
-
-The official Qwen3-TTS code constructs the prefill with specific "thinking" tokens:
-
-```python
-codec_prefill_list = [[
-    codec_nothink_id,    # 2155
-    codec_think_bos_id,  # 2156
-    codec_think_eos_id,  # 2157
-]]
-```
-
-These aren't documented anywhere in the model card or config — I had to read the actual `modeling_qwen3_tts.py` source (1,800+ lines of generation logic) to find them. My initial implementation used `[CODEC_PAD, CODEC_PAD, CODEC_PAD]` which gave the model a completely different conditioning signal.
-
-I also discovered that the trailing text should strip the last 5 tokens (`<|im_end|>\n<|im_start|>assistant\n`) — the official code uses `input_id[:, 4:-5]`. Without this, the model was trying to "speak" chat template tokens.
-
-## Insight 7: Precomputing Everything That Doesn't Change
-
-Every millisecond in TTFC matters. I identified that several embeddings are constant across all utterances:
-
-- Role tokens (`<|im_start|>assistant\n`) — always the same 3 tokens
-- TTS special tokens (PAD, BOS, EOS) — fixed token IDs
-- Codec thinking tags (nothink, think_bos, think_eos) — always the same
-- The fused codec+TTS tag embeddings — combination of the above
-
-All of these were precomputed during `initialize()` and cached as tensor attributes. This saved ~6ms per utterance — the difference between 84ms and 78ms TTFC.
-
-## Insight 8: Word-Count Beats Character-Count for Frame Estimation
-
-When I needed a heuristic to estimate how many audio frames to generate (since EOS is unreliable), my first attempt used character count:
-
-```python
-estimated_audio_sec = len(text) / 3.0  # 3 chars/sec
-```
-
-This was wildly off — 3 chars/sec means "Hello" takes 1.7 seconds, and a 300-character paragraph generates 150 seconds of audio (mostly silence).
-
-Word count turned out to be much more stable:
-
-```python
-word_count = len(text.split())
-estimated_speech_sec = word_count / 2.5  # ~150 words/min
-max_frames = int(estimated_speech_sec * 12.5 * 2.0)  # 2x margin
-```
-
-At 2.5 words/sec (150 WPM), "Hello, how are you today?" (5 words) gets 50 frames (4 seconds), and a 52-word paragraph gets 520 frames (41.6 seconds). The 2x margin ensures the model has enough room to finish naturally, while keeping the total audio duration reasonable.
-
-## What I'd Do Differently
-
-If I had more time, two things would make the biggest difference:
-
-1. **Implement M-RoPE in the kernel**: This would fix EOS detection, eliminate the frame limit heuristic, and likely improve audio quality. The change is surgical — modify the RoPE rotation in `ldg_attention` to split the 64 head dimension pairs into 3 groups of [24, 20, 20] with independent position counters. Risky but high-reward.
-
-2. **Token suppression**: The official implementation suppresses tokens 2048-3071 (except EOS=2150) during talker decode. Without this, the model can generate meaningless special tokens. Adding a suppression mask to the LM head argmax/sampling logic would be straightforward in Python (zero out logits for suppressed tokens before the kernel's argmax).
-
-Both of these would improve audio quality without affecting performance.
+If I had more time, two things would make the biggest difference. First, implementing M-RoPE in the kernel — this would fix the EOS detection issue, eliminate the frame limit heuristic, and likely improve audio quality for longer utterances. The change is surgical (modify the RoPE rotation to split head dimensions into three groups), but it touches the most performance-sensitive part of the kernel, so it needs careful testing. Second, adding token suppression — the official implementation blocks certain token IDs during generation to prevent the model from emitting meaningless special tokens. Adding this in Python (zeroing out logits before the argmax) would be straightforward and would improve output quality.

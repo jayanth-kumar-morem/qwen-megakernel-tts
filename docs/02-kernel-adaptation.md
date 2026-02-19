@@ -1,126 +1,29 @@
-# Adapting the Megakernel for Qwen3-TTS
+# Understanding and Adapting the Megakernel
 
-## Understanding What Needed to Change
+I opened `kernel.cu` for the first time and stared at about 1,600 lines of CUDA C. I definitely didn't understand it all at once. I spent a while just scrolling through, reading comments, Googling terms like "shared memory carveout" and "L1 bypass loads," slowly building a mental model of what this thing does.
 
-The first thing I did was study both codebases side by side: AlpinDale's megakernel (targeting Qwen3-0.6B text generation) and the Qwen3-TTS model architecture.
+What I eventually pieced together is that the megakernel is one giant GPU program. Normally, when PyTorch runs a transformer, it launches a separate GPU operation for every matrix multiply, every attention computation, every normalization — dozens of launches per layer, and there are 28 layers. Each launch has overhead. The megakernel avoids all of that by doing everything in a single launch: 128 groups of 512 threads work together, passing data through fast on-chip memory instead of going back to slow global memory between steps.
 
-The good news hit me almost immediately — the talker decoder inside Qwen3-TTS **is** a Qwen3-0.6B model. Same hidden size (1024), same number of layers (28), same number of attention heads (16 query, 8 KV), same head dimension (128), same intermediate size (3072). The transformer backbone is identical.
+With that rough understanding, I moved on to figuring out what the TTS model actually looks like. I went to the Qwen3-TTS page on HuggingFace and started digging into the model config. Qwen3-TTS has several components — a text tokenizer, a "talker decoder" that generates audio codes step by step, a "code predictor" that expands each code into a richer representation, and a vocoder that turns codes into audio waveform. The talker decoder is the part the megakernel needs to run.
 
-The differences turned out to be small but critical:
+And here's where I got lucky: the talker decoder turned out to be architecturally identical to Qwen3-0.6B, the model the megakernel was originally built for. Same hidden size, same number of layers, same attention head configuration. The transformer backbone is a perfect match. The differences were just in the vocabulary size (3,072 audio codes vs. 151,936 text tokens), the RoPE base frequency (a position encoding parameter), and the fact that the output layer uses a separate weight matrix instead of sharing with the input embeddings.
 
-| Parameter | Qwen3-0.6B (text) | Qwen3-TTS (talker) |
-|---|---|---|
-| Vocab size | 151,936 | 3,072 |
-| RoPE theta | 10,000 | 1,000,000 |
-| LM head | Tied to embeddings | Separate `codec_head` |
-| RoPE type | Standard | M-RoPE (mrope_section: [24, 20, 20]) |
+This meant I wouldn't need to rewrite the kernel. I just needed to adjust a few things.
 
-## Change 1: Vocab Size (The Easy Win)
+The vocabulary size was the easiest change. The kernel uses a compile-time constant called `LDG_VOCAB_SIZE` that determines how the output layer scans across all possible tokens. AlpinDale's build script passes this to the compiler as a `-D` flag. I created `build_tts.py`, a version of the build script with two numbers changed: vocabulary size from 151,936 to 3,072, and the number of thread blocks for the output layer from 1,280 down to 16 (fewer tokens means fewer blocks needed to scan them). No actual kernel code changes — just different compile-time constants.
 
-The text model has a 151K vocabulary. The TTS talker uses a 3,072-token codec vocabulary. This means the LM head (the matrix multiply that converts hidden states to logits over the vocabulary) is **48x smaller**.
+The embedding sentinel took more thought. In a normal chatbot, each decode step feeds the model a single token ID — say, token 1234 — and the kernel looks up that token's embedding from a table. But in TTS, the input to each decode step is more complex. After generating an audio frame (which has 16 codebook groups), you need to combine all 16 embeddings plus a text embedding into a single vector. There's no single token ID for that.
 
-In the kernel, the LM head runs as a separate kernel launch after the main transformer. It uses `LDG_LM_NUM_BLOCKS` thread blocks to scan the vocabulary. For 151K tokens, AlpinDale used 1,280 blocks. For 3,072 tokens, I only needed 16.
+I considered launching a separate GPU operation to compute this combined embedding, but that would add overhead every single frame. Instead, I added 3 lines to the kernel: if the token ID is negative (specifically -1), the kernel skips the embedding table lookup and reads from a buffer where Python has already placed the pre-combined embedding. When the token ID is normal (zero or positive), it works exactly as before. This gave me a clean interface — `step(token_id)` for normal decoding, `step_with_embed(embedding)` for the combined case — without any extra GPU launches.
 
-I created `build_tts.py` (a modified version of `build.py`) that passes these compile-time constants:
+Then came the discovery that I think had the biggest impact on the whole project. While reading the kernel's main loop, I noticed that the number of transformer layers isn't hardcoded — it's a parameter passed in at runtime. The loop just says "for layer 0 to num_layers." AlpinDale designed it this way for flexibility.
 
-```python
-"-DLDG_VOCAB_SIZE=3072",      # was 151936
-"-DLDG_LM_NUM_BLOCKS=16",     # was 1280
-```
+This mattered because the code predictor (the component that expands each audio code into 15 more codebook groups) is itself a small transformer — just 5 layers. My first version used standard PyTorch for it, which worked but took 179 milliseconds per audio frame. That was a problem I'd deal with later during performance optimization, but the seed was planted here: if `num_layers` is just a number I pass in, maybe I could run the code predictor through the megakernel too, with `num_layers=5` instead of 28.
 
-That's it. No kernel code changes needed for the vocab size — the kernel reads `LDG_VOCAB_SIZE` from the compile-time define.
+I tried it. The code predictor dropped from 179ms to 10.9ms. An 18x speedup without changing a single line of kernel code. I'll go into more detail in the performance doc, but this was the single most important thing I figured out.
 
-## Change 2: The Embedding Sentinel (The Clever Hack)
+The last kernel-adjacent change was the RoPE base frequency. RoPE is how transformers track the position of tokens in a sequence. The TTS model uses a different base value (1,000,000 instead of 10,000), but this only affects the precomputed position tables, which are calculated in Python and passed to the kernel. No kernel code changes needed.
 
-This is where things got interesting. In standard text generation, the kernel's input is a **token ID** — it looks up the embedding from a table. But in TTS, the input to each decode step is a **sum of embeddings**: all 16 codebook embeddings from the previous frame, plus a trailing text embedding. There's no single token ID to look up.
+There was one thing I couldn't easily handle. The TTS model's config mentions "M-RoPE" — a variant that splits the position encoding into three sections for handling different types of data (text, audio, video). The megakernel only supports standard single-section RoPE. Implementing M-RoPE would mean modifying the attention computation, which is the most performance-critical and delicate part of the kernel. I decided the risk wasn't worth it — one subtle bug there could silently corrupt every output. For text-only input, the three M-RoPE sections happen to use the same position values anyway, so the practical impact is limited. The main consequence is that the model doesn't reliably know when to stop generating, which I handle with a heuristic (more on that later). I document this as a known limitation.
 
-I had two options:
-1. Add a separate embedding kernel launch before each decode step (extra launch overhead)
-2. Patch the kernel to optionally read from a precomputed buffer
-
-I went with option 2. The patch was exactly 3 lines in `kernel.cu`:
-
-```c
-// Sentinel: if token_id < 0, use hidden_buffer (precomputed embedding)
-const __nv_bfloat16 *embed_row =
-    (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
-                          : hidden_buffer;
-```
-
-When Python passes `token_id = -1`, the kernel skips the embedding table lookup and reads directly from the `hidden_buffer` (where Python has already written the summed embedding). When `token_id >= 0`, it works exactly as before. Zero overhead, fully backward-compatible.
-
-This enabled a clean Python API:
-
-```python
-# Standard decode (codec token lookup):
-next_token, hidden = talker.step(token_id=2149)  # CODEC_BOS
-
-# Precomputed embedding (sum of codec embeds + text):
-next_token, hidden = talker.step_with_embed(summed_embedding)
-```
-
-## Change 3: Runtime num_layers (Already There)
-
-This was the discovery that made the biggest performance difference, and I didn't have to change a single line in the kernel.
-
-The megakernel's decode function already accepts `num_layers` as a **runtime parameter**. AlpinDale designed it this way for flexibility. The kernel loop simply runs `for (int layer = 0; layer < num_layers; layer++)`.
-
-I realized this meant I could reuse the **exact same compiled kernel** for both:
-- The **talker decoder** (28 layers) — the main speech generation model
-- The **code predictor** (5 layers) — a smaller transformer that generates codebook groups
-
-My first implementation of the code predictor used pure PyTorch (70+ separate CUDA kernel launches per step): **179 ms per frame**. When I switched to the megakernel with `num_layers=5`: **10.9 ms per frame**. An **18x speedup** from a zero-line kernel change.
-
-The trick was packing the code predictor's weights into the same `LDGLayerWeights` struct format the kernel expects, allocating a separate (smaller) KV cache, and calling the same `decode` op with `num_layers=5`.
-
-## Change 4: RoPE Theta
-
-The talker uses `rope_theta = 1,000,000` instead of the text model's `10,000`. This only affects the precomputed cos/sin tables — no kernel changes needed. I compute the tables in Python during weight loading:
-
-```python
-inv_freq = 1.0 / (1_000_000.0 ** (torch.arange(0, 128, 2) / 128))
-```
-
-## The M-RoPE Problem (What I Couldn't Fix)
-
-Here's where I hit a wall. The talker decoder's config specifies M-RoPE (Multimodal RoPE) with `mrope_section: [24, 20, 20]` and `interleaved: True`. This means the 64 head dimension pairs are split into 3 groups (24, 20, 20), each using a potentially different position ID.
-
-The megakernel implements standard 1D RoPE — all pairs use the same position. Implementing M-RoPE in the kernel would require:
-1. Splitting the RoPE rotation into 3 sections within the attention computation
-2. Passing 3 position IDs per step instead of 1
-3. Modifying the cos/sin lookup logic
-
-This is a non-trivial kernel change (touching the attention hot path), and I decided the risk of breaking the carefully-tuned kernel outweighed the benefit. Instead, I noted that for text-only TTS (no vision input), the 3 M-RoPE position IDs are identical — so M-RoPE reduces to standard RoPE with the same cos/sin values.
-
-**The catch**: the model was *trained* with M-RoPE, and the attention patterns still diverge over long sequences. The practical effect is that the model never reliably emits the EOS token. I worked around this with a word-count-based frame limit (see the performance optimization doc).
-
-## Weight Loading
-
-The weight loading was straightforward but tedious — mapping 478 tensors from the HuggingFace safetensors format to the megakernel's expected layout:
-
-```python
-# Per-layer weights (11 tensors per layer, same order as LDGLayerWeights struct)
-for i in range(28):
-    p = f"talker.model.layers.{i}."
-    layer_weights.extend([
-        state[p + "input_layernorm.weight"],
-        state[p + "self_attn.q_proj.weight"],
-        state[p + "self_attn.k_proj.weight"],
-        # ... 8 more per layer
-    ])
-```
-
-The order matters — the kernel expects the exact struct layout defined in `kernel.cu`. One wrong tensor and you get garbage output (or a crash).
-
-I also loaded the text projection weights (a 2-layer MLP that maps text embeddings from dimension 2048 to 1024), the code predictor weights (5 transformer layers + 15 per-group LM heads and embeddings), and the speaker encoder weights (loaded but not used in this implementation).
-
-## Summary of Kernel Changes
-
-| Change | Location | Lines Changed | Impact |
-|---|---|---|---|
-| Vocab size | `build_tts.py` (compile flags) | 2 | LM head 48x smaller |
-| Embedding sentinel | `kernel.cu` | 3 | Precomputed embedding input |
-| RoPE theta | `model_tts.py` (Python) | 1 | Correct rotation tables |
-| num_layers reuse | (none — already supported) | 0 | 18x code predictor speedup |
-
-Total kernel code changes: **3 lines**. Everything else was Python-side integration.
+All told, I changed 3 lines in `kernel.cu`, 2 constants in the build script, and wrote all the rest in Python. The kernel barely needed touching — the real work was understanding how everything fits together.

@@ -1,142 +1,35 @@
-# Building the TTS Pipeline & Pipecat Integration
+# Building the TTS Pipeline and Pipecat Integration
 
-## Understanding the Qwen3-TTS Inference Flow
+I came into this not really knowing how text-to-speech systems work. I knew that text goes in and audio comes out, but the actual mechanics were a mystery. So before writing any pipeline code, I sat down with the Qwen3-TTS source code — specifically `modeling_qwen3_tts.py`, which ships with the model — and traced through what happens when you give it a sentence.
 
-Before writing any pipeline code, I needed to understand exactly how Qwen3-TTS turns text into audio. I read through the official `modeling_qwen3_tts.py` (shipped with the model under `trust_remote_code=True`) and traced the generation flow:
+The picture that emerged was surprisingly logical once I saw it. First, the text gets tokenized (turned into numbers) and embedded (turned into vectors), with a small neural network resizing those vectors to match the decoder's expectations. Then a "prefill" step primes the decoder with some special tokens — kind of like clearing its throat before it starts speaking. Then the actual generation loop begins: each step, the decoder produces one audio code and some internal state. A second, smaller model (the "code predictor") takes that internal state and expands it into 15 more codes. Together, those 16 codes form one "frame" of audio. The model generates about 12.5 frames per second. Finally, a vocoder — another neural network — takes the accumulated codes and turns them into the actual waveform you can hear, at 24,000 samples per second.
 
-1. **Tokenize** the input text with the chat template: `<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n`
-2. **Project** text token embeddings from dimension 2048 to 1024 via a learned SiLU-activated MLP
-3. **Prefill** the talker decoder with a carefully constructed sequence of role tokens, codec thinking tokens, and the first text token fused with codec BOS
-4. **Autoregressive decode**: each step the talker produces a codebook token + hidden state. The code predictor takes the hidden state and generates 15 more codebook groups. All 16 groups form one audio "frame" at 12.5 Hz
-5. **Vocoder**: accumulated codec frames are decoded to 24 kHz PCM audio
+Understanding this pipeline was the foundation for everything else.
 
-## The Prefill Format Discovery
+The trickiest part was getting the prefill format right. The decoder expects a very specific sequence of tokens before it starts generating audio. I initially guessed at this based on the model's tokenizer documentation, but the audio came out distorted.
 
-Getting the prefill format right was one of the trickiest parts. I initially used a simplified format — just role tokens, some padding, and the text. The model generated audio, but it sounded wrong and EOS never triggered.
+I went back to the source code and traced through the exact construction, around line 2136. What I found was an 8-step sequence that includes "thinking tokens" — special markers (with IDs 2155, 2156, 2157) that represent a compressed thinking phase. These aren't documented in the model card or the config file. I only found them by reading the actual generation code line by line. My first attempt had used generic padding tokens in those positions, which gave the model a completely different conditioning signal. Once I matched the exact official format, audio quality improved noticeably.
 
-I went back to the official source code and found the exact construction (lines 2136-2160 of `modeling_qwen3_tts.py`):
+I also discovered something about how the text feeds into the generation loop. It's not just the previous audio codes that go in as input each step — there's also a text embedding that advances one token per frame. The model is essentially "reading along" with the text as it generates speech. Getting this wrong was subtle — if you include the wrong tokens (like chat template formatting characters at the end of the text), the model tries to "speak" those characters, which produces garbage after the actual content. I figured out from the source code that you need to strip the first token (already consumed during prefill) and the last five (which are just `<|im_end|>\n<|im_start|>assistant\n` formatting).
 
-```
-Position 0: role_embed[0] (from "<|im_start|>")
-Position 1: role_embed[1] (from "assistant")
-Position 2: role_embed[2] (from "\n")
-Position 3: tts_pad_embed + codec_embed(nothink)     ← "thinking" tokens!
-Position 4: tts_pad_embed + codec_embed(think_bos)
-Position 5: tts_pad_embed + codec_embed(think_eos)
-Position 6: tts_bos_embed + codec_embed(pad)
-Position 7: first_text_embed + codec_embed(bos)       ← text starts here
-```
+With the prefill and trailing text sorted out, the model was generating reasonable audio. But it wasn't streaming yet.
 
-The key insight was that positions 3-6 aren't just padding — they're **thinking tokens** (nothink=2155, think_bos=2156, think_eos=2157) that the model was trained to expect. My initial version used `[PAD, PAD, PAD]` for the codec tags, which gave the model a completely wrong conditioning signal.
+The assignment was very clear about streaming: audio chunks should be pushed as they're generated, not buffered until the entire utterance is done. This matters a lot for a voice agent — you want the user to start hearing the response immediately, not wait 5 seconds for the whole sentence to render.
 
-After fixing this to match the official format, the prefill went from 7 steps to the correct 8 steps. Audio quality improved immediately.
+My first version collected all the audio frames into a list and returned them all at once. The streaming wrapper then iterated over this list. The problem was obvious once I looked at the timing: the model generated all 2,048 frames before any audio went out. Streaming TTFC was 35 seconds. Not exactly real-time.
 
-## The Trailing Text Mechanism
+The fix was almost embarrassingly simple. I changed the frame generation function from building a list (`frames.append(code); return frames`) to a Python generator (`yield code`). A generator hands each frame to the consumer the moment it's produced, without waiting for the rest. This single change — literally replacing `append` + `return` with `yield` — dropped TTFC from 35 seconds to about 1 second.
 
-During autoregressive decode, each frame's input embedding isn't just the sum of the previous frame's codec embeddings — it also includes a **trailing text embedding**. The model consumes one text token per frame as additional conditioning:
+Still too slow, though. The remaining bottleneck was the vocoder's first decode call, which took about 834 milliseconds due to internal lazy initialization (memory allocation, compiled operations, etc.). I added warmup calls during engine startup — a few dummy decode operations that force all this initialization to happen upfront, when nobody's waiting for audio. After warmup, each vocoder call takes about 38ms.
 
-```python
-if trailing_idx < trailing_text.shape[0]:
-    embed_sum = embed_sum + trailing_text[trailing_idx]
-    trailing_idx += 1
-else:
-    embed_sum = embed_sum + tts_pad_embed  # text exhausted
-```
+I also changed the first chunk size. Instead of waiting for 10 frames to fill up a chunk (about 800ms of audio), I send the very first frame by itself as soon as it's ready. It's only 80ms of audio — barely a syllable — but it means the user hears something almost instantly. After that first quick chunk, subsequent chunks batch 10 frames for efficiency.
 
-I discovered from the official code that the trailing text should be `input_ids[4:-5]` — strip the first token (already in prefill) and the last 5 format-end tokens (`<|im_end|>\n<|im_start|>assistant\n`). Getting this wrong meant feeding chat template tokens as "speech content," which caused the model to generate garbage after the actual text.
+One more thing caught me off guard. I'd warmed up the kernel and the vocoder, but the first code predictor call was still taking 107ms instead of the expected 13ms. After some investigation, I realized that PyTorch's sampling operations — the functions that randomly pick a token from the probability distribution instead of just taking the most likely one — have their own first-call overhead. My warmup only ran the deterministic (argmax) path. Once I added warmup calls that also exercise the sampling path (torch.multinomial, torch.softmax, torch.topk), the first-call penalty disappeared.
 
-## Making It Stream: The Generator Revelation
+All three of these — vocoder warmup, first-frame-first chunking, and sampling path warmup — brought the streaming TTFC from about 1 second down to about 80 milliseconds.
 
-My first implementation of `_generate_codec_frames` returned a list:
+With the engine working and streaming, the Pipecat integration was the cleanest part of the whole project. Pipecat is a framework for building voice agents — it connects speech-to-text, language models, and text-to-speech into a pipeline where data flows through each component. I read through their docs and examples and found that the TTS service interface is well-designed: you subclass `TTSService`, implement a `run_tts` method that yields audio frames, and the framework handles everything else — routing, turn management, interruptions.
 
-```python
-def _generate_codec_frames(self, text):
-    frames = []
-    for step in range(max_frames):
-        # ... generate frame ...
-        frames.append(all_codes)
-    return frames
-```
+My implementation yields a "started" frame, then streams audio chunks as the megakernel engine generates them (converting from the vocoder's float32 output to the 16-bit PCM that Pipecat expects), then yields a "stopped" frame. The engine initialization happens lazily on first use, so there's no startup delay when the pipeline is constructed.
 
-The streaming wrapper called `synthesize_streaming()` which iterated over the returned list. The problem? **It blocked until ALL frames were generated before yielding the first chunk.** The streaming TTFC was 35,932ms — the model generated 2,048 frames before any audio reached the consumer.
-
-The fix was embarrassingly simple — convert it to a Python generator:
-
-```python
-def _generate_codec_frames(self, text):
-    for step in range(max_frames):
-        # ... generate frame ...
-        yield all_codes  # yields immediately!
-```
-
-TTFC dropped from 35,932ms to 1,096ms instantly. The generator yields each frame as it's produced, so the streaming wrapper can decode and send the first chunk without waiting for the full utterance.
-
-## The First-Chunk Optimization
-
-Even at 1,096ms, the TTFC was too high. The bottleneck was now the vocoder's first decode call (~900ms cold start). I added three optimizations:
-
-**1. Vocoder warmup during initialization:**
-```python
-# Warm up the vocoder with dummy decodes
-for n in [1, 1, 5]:
-    dummy_codes = torch.randint(0, 2048, (n, 16), device="cuda")
-    self.speech_tokenizer.decode([{"audio_codes": dummy_codes}])
-```
-
-**2. Yield the first frame immediately** (1 frame instead of waiting for a full 10-frame chunk):
-```python
-target = 1 if first_chunk else chunk_size
-if len(buffer) >= target:
-    audio, sr = self._decode_to_audio(buffer)
-    first_chunk = False
-    yield audio, sr
-```
-
-**3. Warm up BOTH argmax and sampling code paths:**
-```python
-for do_sample in [False, False, True, True, True]:
-    self.talker.reset()
-    _, h = self.talker.step(CODEC_BOS)
-    self.code_predictor.predict(h, 0, embed_weight, do_sample=do_sample)
-```
-
-I discovered the sampling path (torch.multinomial, softmax, topk) has its own first-call overhead separate from the argmax path. Without warming both, the code predictor took 107ms on the first call instead of 13ms.
-
-These three changes brought streaming TTFC from 1,096ms down to ~80ms.
-
-## Pipecat Integration
-
-The Pipecat integration was the cleanest part of the project. Pipecat's `TTSService` interface is well-designed — you implement `run_tts(text, context_id)` as an async generator that yields frames:
-
-```python
-class MegakernelTTSService(TTSService):
-    async def run_tts(self, text, context_id):
-        yield TTSStartedFrame(context_id=context_id)
-
-        async for audio_chunk, sr in engine.synthesize_streaming(text):
-            pcm16 = _float32_to_pcm16(audio_chunk)
-            yield TTSAudioRawFrame(
-                audio=pcm16, sample_rate=sr,
-                num_channels=1, context_id=context_id
-            )
-
-        yield TTSStoppedFrame(context_id=context_id)
-```
-
-The engine initialization happens lazily on first use (or eagerly via Pipecat's `start()` hook). The streaming synthesis runs in the async event loop — each chunk is yielded as soon as the vocoder decodes it.
-
-The service handles:
-- **TTFB metrics**: `start_ttfb_metrics()` / `stop_ttfb_metrics()` called around the first chunk
-- **Usage metrics**: tracks text length for billing/monitoring
-- **Error handling**: catches exceptions and yields `ErrorFrame` instead of crashing the pipeline
-- **Float32 to PCM16 conversion**: Pipecat expects 16-bit PCM bytes, the vocoder outputs float32
-
-## The Audio Format
-
-Qwen3-TTS outputs 24 kHz mono audio. The vocoder (Qwen3-TTS-Tokenizer-12Hz) takes codec frames at 12.5 Hz and produces 1,920 PCM samples per frame (= 80ms of audio at 24 kHz). The Pipecat service converts this to 16-bit PCM bytes for transport.
-
-Each streaming chunk contains either:
-- 1 frame (1,920 samples = 80ms) for the first chunk (minimum TTFC)
-- 10 frames (19,200 samples = 800ms) for subsequent chunks (efficient batching)
-
-This gives a good balance between low latency (first chunk arrives fast) and efficiency (subsequent chunks are batched to reduce vocoder call overhead).
+For the full voice agent demo, I wired it together with Deepgram for speech-to-text and OpenAI for the language model response generation. The pipeline flows like a conversation: the user speaks, Deepgram transcribes it, OpenAI generates a text response, and our megakernel TTS speaks it back. There's also a text-only mode that lets you type text and hear it spoken, which is useful for testing the TTS in isolation without needing a microphone or API keys.
