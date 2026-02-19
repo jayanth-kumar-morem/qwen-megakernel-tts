@@ -1,9 +1,12 @@
-"""Qwen Megakernel — single-kernel Qwen3-0.6B decode for RTX 5090."""
+"""Qwen Megakernel — single-kernel Qwen3 decode for RTX 5090.
 
-from qwen_megakernel.build import get_extension as _get_ext
+For TTS usage:
+    from qwen_megakernel.tts_engine import MegakernelTTSEngine, TTSConfig
 
-_get_ext()
+For Pipecat integration:
+    from qwen_megakernel.pipecat_tts import MegakernelTTSService
 
-from qwen_megakernel.model import load_weights, Decoder, generate  # noqa: E402
+Note: CUDA compilation is deferred until the kernel is actually used.
+"""
 
-__all__ = ["load_weights", "Decoder", "generate"]
+__all__ = []

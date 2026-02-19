@@ -15,6 +15,8 @@ KV_SIZE = 8 * HEAD_DIM  # 1024
 MAX_SEQ_LEN = 2048
 VOCAB_SIZE = 151936
 
+from .build import get_extension as _get_extension
+_get_extension()
 _decode = torch.ops.qwen_megakernel_C.decode
 
 

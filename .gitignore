@@ -39,3 +39,6 @@ Thumbs.db
 *.bin
 *.safetensors
 .ref/
+
+# Generated audio
+*.wav

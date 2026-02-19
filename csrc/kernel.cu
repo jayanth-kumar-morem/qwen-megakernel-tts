@@ -70,8 +70,10 @@ constexpr int KV_SIZE = NUM_KV_HEADS * HEAD_DIM; // 1024
 constexpr int LDG_NUM_WARPS = LDG_BLOCK_SIZE / WARP_SIZE;
 constexpr float LDG_RMS_EPS = 1e-6f;
 
-// LM head
-constexpr int LDG_VOCAB_SIZE = 151936;
+// LM head (configurable via -DLDG_VOCAB_SIZE=N at compile time)
+#ifndef LDG_VOCAB_SIZE
+#define LDG_VOCAB_SIZE 151936
+#endif
 
 struct LDGLayerWeights {
   const __nv_bfloat16 *input_layernorm_weight;
@@ -1239,7 +1241,10 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
                       1};
 
   // First layer reads embed row directly (no separate embed + barrier needed)
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // Sentinel: if token_id < 0, use hidden_buffer (precomputed embedding)
+  const __nv_bfloat16 *embed_row =
+      (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
+                            : hidden_buffer;
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
@@ -1248,8 +1253,8 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
     __nv_bfloat16 *layer_k_cache = k_cache + layer * kv_cache_layer_stride;
     __nv_bfloat16 *layer_v_cache = v_cache + layer * kv_cache_layer_stride;
 
-    // Layer 0: read directly from embedding table. Other layers: from
-    // hidden_buffer.
+    // Layer 0: read directly from embedding table (or hidden_buffer if sentinel).
+    // Other layers: from hidden_buffer.
     const __nv_bfloat16 *layer_input = (layer == 0) ? embed_row : hidden_buffer;
 
     ldg_matvec_qkv(grid, layer_input, w.input_layernorm_weight, w.q_proj_weight,
@@ -1356,7 +1361,10 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   AtomicGridSync grid{barrier_counter, barrier_sense, (unsigned int)gridDim.x,
                       1};
 
-  const __nv_bfloat16 *embed_row = embed_weight + input_token_id * HIDDEN_SIZE;
+  // Sentinel: if token_id < 0, use hidden_buffer (precomputed embedding)
+  const __nv_bfloat16 *embed_row =
+      (input_token_id >= 0) ? embed_weight + input_token_id * HIDDEN_SIZE
+                            : hidden_buffer;
 
   int kv_cache_layer_stride = NUM_KV_HEADS * max_seq_len * HEAD_DIM;
 
